@@ -5,7 +5,7 @@ const fs = require("fs");
 const path = require("path");
 
 const HOST = process.env.HEARTLINK_HOST || "0.0.0.0";
-const PORT = Number(process.env.HEARTLINK_PORT || 5310);
+const PORT = Number(process.env.PORT || process.env.HEARTLINK_PORT || 5310);
 const DATA_DIR = path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "messages.json");
 const MAX_MESSAGES_PER_ROOM = 2000;
