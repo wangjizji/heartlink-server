@@ -71,6 +71,22 @@ const readJsonBody = (request) => new Promise((resolve, reject) => {
   request.on("error", reject);
 });
 
+const readBinaryBody = (request) => new Promise((resolve, reject) => {
+  const chunks = [];
+  let size = 0;
+  request.on("data", (chunk) => {
+    size += chunk.length;
+    if (size > 10 * 1024 * 1024) {
+      reject(new Error("文件超过 10 MB 限制"));
+      request.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
+  request.on("end", () => resolve(Buffer.concat(chunks)));
+  request.on("error", reject);
+});
+
 const getRoom = (roomId) => {
   if (!store.rooms[roomId]) store.rooms[roomId] = { updatedAt: Date.now(), messages: [] };
   return store.rooms[roomId];
@@ -190,6 +206,22 @@ const server = http.createServer(async (request, response) => {
     }
     if (method === "POST" && !storedId) {
       try {
+        const contentType = String(request.headers["content-type"] || "").split(";", 1)[0].trim().toLowerCase();
+        if (contentType === "application/octet-stream" || contentType.startsWith("video/")) {
+          const buffer = await readBinaryBody(request);
+          if (!buffer.length) {
+            sendJson(response, 400, { error: "文件内容为空" });
+            return;
+          }
+          const id = fileId();
+          const mimeType = contentType.startsWith("video/") ? contentType : "application/octet-stream";
+          const originalName = decodeURIComponent(String(request.headers["x-file-name"] || "视频")).trim() || "视频";
+          const fileName = `${id}__${encodeURIComponent(mimeType)}__${safeFileName(originalName)}`;
+          await fs.promises.mkdir(UPLOAD_DIR, { recursive: true });
+          await fs.promises.writeFile(path.join(UPLOAD_DIR, fileName), buffer);
+          sendJson(response, 201, { id, url: `/api/chat/files/${encodeURIComponent(id)}`, name: originalName, mimeType, size: buffer.length });
+          return;
+        }
         const payload = await readJsonBody(request);
         const data = String(payload && payload.data || "").trim();
         if (!data) {
