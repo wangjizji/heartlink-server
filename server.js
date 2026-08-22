@@ -3,6 +3,7 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const { Pool } = require("pg");
 
 const HOST = process.env.HEARTLINK_HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || process.env.HEARTLINK_PORT || 5310);
@@ -24,6 +25,30 @@ const loadStore = () => {
 
 let store = loadStore();
 let saveQueue = Promise.resolve();
+const databasePool = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
+
+const initializePersistence = async () => {
+  if (!databasePool) return;
+  await databasePool.query(`
+    CREATE TABLE IF NOT EXISTS heartlink_store (
+      id INTEGER PRIMARY KEY,
+      payload JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  const result = await databasePool.query("SELECT payload FROM heartlink_store WHERE id = 1");
+  if (result.rows[0]?.payload && typeof result.rows[0].payload === "object") {
+    store = result.rows[0].payload;
+    return;
+  }
+  await databasePool.query(
+    "INSERT INTO heartlink_store (id, payload) VALUES (1, $1::jsonb) ON CONFLICT (id) DO NOTHING",
+    [JSON.stringify(store)]
+  );
+};
+
 const saveStore = () => {
   const snapshot = JSON.stringify(store, null, 2);
   saveQueue = saveQueue.then(async () => {
@@ -31,6 +56,12 @@ const saveStore = () => {
     const tempFile = `${DATA_FILE}.tmp`;
     await fs.promises.writeFile(tempFile, snapshot, "utf8");
     await fs.promises.rename(tempFile, DATA_FILE);
+    if (databasePool) {
+      await databasePool.query(
+        "INSERT INTO heartlink_store (id, payload, updated_at) VALUES (1, $1::jsonb, NOW()) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()",
+        [snapshot]
+      );
+    }
   }).catch((error) => console.error("保存消息数据失败：", error.message));
   return saveQueue;
 };
@@ -750,9 +781,16 @@ const server = http.createServer(async (request, response) => {
   sendJson(response, 405, { error: "当前请求方法不支持" });
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`HeartLink 娑堟伅鏈嶅姟鍣ㄥ凡鍚姩锛歨ttp://${HOST}:${PORT}`);
-  console.log(`鍋ュ悍妫€鏌ワ細http://127.0.0.1:${PORT}/api/health`);
-});
+initializePersistence()
+  .then(() => {
+    server.listen(PORT, HOST, () => {
+      console.log(`HeartLink server started: http://${HOST}:${PORT}`);
+      console.log(`Health check: http://127.0.0.1:${PORT}/api/health`);
+    });
+  })
+  .catch((error) => {
+    console.error("Database initialization failed:", error.message);
+    process.exit(1);
+  });
 
 
