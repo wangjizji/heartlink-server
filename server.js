@@ -107,8 +107,8 @@ const readBinaryBody = (request) => new Promise((resolve, reject) => {
   let size = 0;
   request.on("data", (chunk) => {
     size += chunk.length;
-    if (size > 10 * 1024 * 1024) {
-      reject(new Error("文件超过 10 MB 限制"));
+    if (size > 100 * 1024 * 1024) {
+      reject(new Error("文件超过 100 MB 限制"));
       request.destroy();
       return;
     }
@@ -260,8 +260,8 @@ const server = http.createServer(async (request, response) => {
           return;
         }
         const buffer = Buffer.from(data, "base64");
-        if (!buffer.length || buffer.length > 10 * 1024 * 1024) {
-          sendJson(response, 413, { error: "文件超过 10 MB 限制" });
+        if (!buffer.length || buffer.length > 100 * 1024 * 1024) {
+          sendJson(response, 413, { error: "文件超过 100 MB 限制" });
           return;
         }
         const id = fileId();
