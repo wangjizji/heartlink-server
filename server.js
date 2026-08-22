@@ -8,6 +8,7 @@ const HOST = process.env.HEARTLINK_HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || process.env.HEARTLINK_PORT || 5310);
 const DATA_DIR = path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "messages.json");
+const UPLOAD_DIR = path.join(__dirname, "uploads");
 const MAX_MESSAGES_PER_ROOM = 2000;
 const emptyStore = () => ({ version: 1, rooms: {}, pairings: {} });
 
@@ -89,6 +90,13 @@ const getProfilesStore = () => {
   return store.profiles;
 };
 
+const getCallSignalsStore = () => {
+  if (!store.callSignals || typeof store.callSignals !== "object") {
+    store.callSignals = {};
+  }
+  return store.callSignals;
+};
+
 const normalizePairCode = (value) => String(value || "").trim().toUpperCase();
 
 const getPairing = (code) => {
@@ -121,6 +129,9 @@ const nextPairCode = () => {
   const seed = Math.random().toString(36).slice(2, 8).toUpperCase();
   return `HL-${seed}`;
 };
+
+const safeFileName = (value) => String(value || "文件").replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80) || "file";
+const fileId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 const normalizeMessage = (payload, roomId) => {
   const id = String(payload && payload.id || "").trim();
   const senderId = String(payload && payload.senderId || "").trim();
@@ -151,6 +162,86 @@ const server = http.createServer(async (request, response) => {
     return;
   }
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+  const uploadMatch = url.pathname.match(/^\/api\/chat\/files(?:\/([^/]+))?$/);
+  if (uploadMatch) {
+    const storedId = uploadMatch[1] ? decodeURIComponent(uploadMatch[1]).trim() : "";
+    if (method === "GET" && storedId) {
+      const files = await fs.promises.readdir(UPLOAD_DIR).catch(() => []);
+      const fileName = files.find((name) => name.startsWith(`${storedId}__`));
+      if (!fileName) {
+        sendJson(response, 404, { error: "文件不存在" });
+        return;
+      }
+      const filePath = path.join(UPLOAD_DIR, fileName);
+      const mimeType = decodeURIComponent(fileName.split("__")[1] || "application/octet-stream");
+      try {
+        const stat = await fs.promises.stat(filePath);
+        response.writeHead(200, {
+          "Content-Type": mimeType,
+          "Content-Length": stat.size,
+          "Access-Control-Allow-Origin": "*",
+          "Cache-Control": "public, max-age=86400"
+        });
+        fs.createReadStream(filePath).pipe(response);
+      } catch {
+        sendJson(response, 404, { error: "文件不存在" });
+      }
+      return;
+    }
+    if (method === "POST" && !storedId) {
+      try {
+        const payload = await readJsonBody(request);
+        const data = String(payload && payload.data || "").trim();
+        if (!data) {
+          sendJson(response, 400, { error: "文件内容为空" });
+          return;
+        }
+        const buffer = Buffer.from(data, "base64");
+        if (!buffer.length || buffer.length > 10 * 1024 * 1024) {
+          sendJson(response, 413, { error: "文件超过 10 MB 限制" });
+          return;
+        }
+        const id = fileId();
+        const mimeType = String(payload.mimeType || "application/octet-stream").split(";")[0].trim();
+        const fileName = `${id}__${encodeURIComponent(mimeType)}__${safeFileName(payload.name || "file")}`;
+        await fs.promises.mkdir(UPLOAD_DIR, { recursive: true });
+        await fs.promises.writeFile(path.join(UPLOAD_DIR, fileName), buffer);
+        sendJson(response, 201, { id, url: `/api/chat/files/${encodeURIComponent(id)}`, name: String(payload.name || "文件"), mimeType, size: buffer.length });
+      } catch (error) {
+        sendJson(response, 400, { error: error.message || "文件上传失败" });
+      }
+      return;
+    }
+    sendJson(response, 405, { error: "当前请求方法不支持" });
+    return;
+  }
+  if (method === "POST" && url.pathname === "/api/pairings/recover") {
+    try {
+      const payload = await readJsonBody(request);
+      const deviceId = String(payload && payload.deviceId || "").trim();
+      if (!deviceId) {
+        sendJson(response, 400, { error: "缺少设备编号" });
+        return;
+      }
+      const pairing = Object.values(getPairingsStore()).find((item) => {
+        return item && item.status === "paired" && (String(item.ownerId || "") === deviceId || String(item.guestId || "") === deviceId);
+      }) || null;
+      if (!pairing) {
+        sendJson(response, 404, { error: "没有找到当前设备的已配对关系" });
+        return;
+      }
+      const isOwner = String(pairing.ownerId || "") === deviceId;
+      sendJson(response, 200, {
+        roomId: pairing.roomId,
+        status: pairing.status,
+        role: isOwner ? "owner" : "guest",
+        partnerName: isOwner ? pairing.guestName : pairing.ownerName
+      });
+    } catch (error) {
+      sendJson(response, 400, { error: error.message || "恢复绑定失败" });
+    }
+    return;
+  }
   const profileRoomMatch = url.pathname.match(/^\/api\/profiles\/rooms\/([^/]+)$/);
   if (profileRoomMatch) {
     const roomId = decodeURIComponent(profileRoomMatch[1]).trim().toLowerCase();
@@ -192,6 +283,49 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     sendJson(response, 405, { error: "不支持的请求方法" });
+    return;
+  }
+  const callSignalMatch = url.pathname.match(/^\/api\/call\/rooms\/([^/]+)\/signals$/);
+  if (callSignalMatch) {
+    const roomId = decodeURIComponent(callSignalMatch[1]).trim().toLowerCase();
+    if (!roomId) {
+      sendJson(response, 400, { error: "缺少通话房间号" });
+      return;
+    }
+    const callStore = getCallSignalsStore();
+    if (!Array.isArray(callStore[roomId])) callStore[roomId] = [];
+    const signals = callStore[roomId];
+    if (method === "GET") {
+      const after = Math.max(0, Number(url.searchParams.get("after") || 0));
+      sendJson(response, 200, { signals: signals.filter((item) => Number(item.id || 0) > after) });
+      return;
+    }
+    if (method === "POST") {
+      try {
+        const payload = await readJsonBody(request);
+        const senderId = String(payload && payload.senderId || "").trim();
+        const type = String(payload && payload.type || "").trim();
+        if (!senderId || !type) {
+          sendJson(response, 400, { error: "通话信令不完整" });
+          return;
+        }
+        const signal = {
+          ...payload,
+          id: Date.now() * 1000 + Math.floor(Math.random() * 1000),
+          senderId,
+          type,
+          createdAt: Date.now()
+        };
+        signals.push(signal);
+        if (signals.length > 300) signals.splice(0, signals.length - 300);
+        await saveStore();
+        sendJson(response, 200, { ok: true, signal });
+      } catch (error) {
+        sendJson(response, 400, { error: error.message || "通话信令发送失败" });
+      }
+      return;
+    }
+    sendJson(response, 405, { error: "当前请求方法不支持" });
     return;
   }
   const pairRoomMatch = url.pathname.match(/^\/api\/pairings\/rooms\/([^/]+)(?:\/unbind)?$/);
