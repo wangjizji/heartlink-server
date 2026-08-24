@@ -238,15 +238,15 @@ const server = http.createServer(async (request, response) => {
     if (method === "POST" && !storedId) {
       try {
         const contentType = String(request.headers["content-type"] || "").split(";", 1)[0].trim().toLowerCase();
-        if (contentType === "application/octet-stream" || contentType.startsWith("video/")) {
+        if (contentType && contentType !== "application/json") {
           const buffer = await readBinaryBody(request);
           if (!buffer.length) {
             sendJson(response, 400, { error: "文件内容为空" });
             return;
           }
           const id = fileId();
-          const mimeType = contentType.startsWith("video/") ? contentType : "application/octet-stream";
-          const originalName = decodeURIComponent(String(request.headers["x-file-name"] || "视频")).trim() || "视频";
+          const mimeType = contentType;
+          const originalName = decodeURIComponent(String(request.headers["x-file-name"] || "文件")).trim() || "文件";
           const fileName = `${id}__${encodeURIComponent(mimeType)}__${safeFileName(originalName)}`;
           await fs.promises.mkdir(UPLOAD_DIR, { recursive: true });
           await fs.promises.writeFile(path.join(UPLOAD_DIR, fileName), buffer);
