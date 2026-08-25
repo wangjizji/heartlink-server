@@ -11,6 +11,9 @@ const DATA_DIR = path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "messages.json");
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 const MAX_MESSAGES_PER_ROOM = 2000;
+const CALL_SIGNAL_TTL_MS = 10 * 60 * 1000;
+const OPENAI_API_KEY = String(process.env.OPENAI_API_KEY || "").trim();
+const HEARTLINK_AI_MODEL = String(process.env.HEARTLINK_AI_MODEL || "gpt-5").trim();
 const emptyStore = () => ({ version: 1, rooms: {}, pairings: {} });
 
 const loadStore = () => {
@@ -118,6 +121,49 @@ const readBinaryBody = (request) => new Promise((resolve, reject) => {
   request.on("error", reject);
 });
 
+const handleAiWrite = async (request, response) => {
+  if (!OPENAI_API_KEY) {
+    sendJson(response, 503, { ok: false, code: "AI_NOT_CONFIGURED", message: "AI 服务尚未配置。" });
+    return;
+  }
+  let payload;
+  try { payload = await readJsonBody(request); }
+  catch { sendJson(response, 400, { ok: false, code: "INVALID_JSON", message: "请求内容格式错误。" }); return; }
+  const prompt = String(payload?.prompt || "").trim();
+  if (!prompt) { sendJson(response, 400, { ok: false, code: "PROMPT_REQUIRED", message: "请先写下想表达的内容。" }); return; }
+  if (prompt.length > 1200) { sendJson(response, 400, { ok: false, code: "PROMPT_TOO_LONG", message: "内容太长，请缩短后重试。" }); return; }
+  const scenes = { "love-letter": "想念或情书", apology: "认真道歉", anniversary: "纪念日心意" };
+  const tones = { natural: "自然真诚", gentle: "温柔克制", serious: "认真稳重" };
+  const scene = scenes[String(payload.context || "")] || "日常心意";
+  const tone = tones[String(payload.tone || "")] || "自然真诚";
+  const partnerName = String(payload.partnerName || "TA").trim().slice(0, 40) || "TA";
+  const extraContext = String(payload.extraContext || "").trim().slice(0, 600);
+  const developerPrompt = "你是情侣聊天 App HeartLink 的中文表达助手。只整理用户已经提供的真实想法，不捏造经历，不替用户承诺，不使用道德绑架或催促原谅。只返回 JSON：{\"title\":\"20个汉字以内标题\",\"text\":\"60至180个汉字正文\"}。";
+  const userPrompt = `场景：${scene}\n语气：${tone}\n对方称呼：${partnerName}\n补充背景：${extraContext}\n用户真实想法：${prompt}`;
+  try {
+    const apiResponse = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: HEARTLINK_AI_MODEL, input: [
+        { role: "developer", content: [{ type: "input_text", text: developerPrompt }] },
+        { role: "user", content: [{ type: "input_text", text: userPrompt }] }
+      ], max_output_tokens: 500 })
+    });
+    if (!apiResponse.ok) throw new Error(`OpenAI ${apiResponse.status}`);
+    const result = await apiResponse.json();
+    const outputText = (result.output || []).flatMap((item) => item.content || [])
+      .find((item) => item.type === "output_text")?.text?.trim() || "";
+    const draft = JSON.parse(outputText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, ""));
+    const title = String(draft.title || "").trim().slice(0, 20);
+    const text = String(draft.text || "").trim().slice(0, 180);
+    if (!title || !text) throw new Error("AI 返回内容不完整");
+    sendJson(response, 200, { ok: true, title, text, model: HEARTLINK_AI_MODEL });
+  } catch (error) {
+    console.error("AI 写作失败：", error.message);
+    sendJson(response, 502, { ok: false, code: "AI_GENERATION_FAILED", message: "AI 整理失败，本次不会扣除权益，请稍后重试。" });
+  }
+};
+
 const getRoom = (roomId) => {
   if (!store.rooms[roomId]) store.rooms[roomId] = { updatedAt: Date.now(), messages: [] };
   return store.rooms[roomId];
@@ -142,6 +188,33 @@ const getCallSignalsStore = () => {
     store.callSignals = {};
   }
   return store.callSignals;
+};
+
+const cleanCallSignals = (signals) => {
+  const cutoff = Date.now() - CALL_SIGNAL_TTL_MS;
+  const validSignals = signals.filter((item) => Number(item?.createdAt || 0) >= cutoff);
+  if (validSignals.length > 300) validSignals.splice(0, validSignals.length - 300);
+  return validSignals;
+};
+
+const isPairedDeviceInRoom = (roomId, deviceId) => {
+  const normalizedDeviceId = String(deviceId || "").trim();
+  if (!normalizedDeviceId) return false;
+  return Object.values(getPairingsStore()).some((pairing) => {
+    return pairing && pairing.status === "paired"
+      && String(pairing.roomId || "").trim().toLowerCase() === roomId
+      && (String(pairing.ownerId || "") === normalizedDeviceId || String(pairing.guestId || "") === normalizedDeviceId);
+  });
+};
+
+const normalizeAvatarData = (value) => {
+  const avatarData = String(value || "").trim();
+  if (!avatarData) return "";
+  if (!/^data:image\/(?:jpeg|jpg|png|webp);base64,[a-z0-9+/=]+$/i.test(avatarData)) {
+    throw new Error("头像格式不支持");
+  }
+  if (avatarData.length > 700 * 1024) throw new Error("头像不能超过 512 KB");
+  return avatarData;
 };
 
 const normalizePairCode = (value) => String(value || "").trim().toUpperCase();
@@ -209,6 +282,11 @@ const server = http.createServer(async (request, response) => {
     return;
   }
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+  if (url.pathname === "/api/ai/write") {
+    if (method !== "POST") { sendJson(response, 405, { ok: false, message: "当前请求方法不支持" }); return; }
+    await handleAiWrite(request, response);
+    return;
+  }
   const uploadMatch = url.pathname.match(/^\/api\/chat\/files(?:\/([^/]+))?$/);
   if (uploadMatch) {
     const storedId = uploadMatch[1] ? decodeURIComponent(uploadMatch[1]).trim() : "";
@@ -312,6 +390,11 @@ const server = http.createServer(async (request, response) => {
       sendJson(response, 400, { error: "缺少房间号" });
       return;
     }
+    const deviceId = String(request.headers["x-device-id"] || "").trim();
+    if (!isPairedDeviceInRoom(roomId, deviceId)) {
+      sendJson(response, 403, { error: "无权访问该房间资料" });
+      return;
+    }
     const profilesStore = getProfilesStore();
     if (!profilesStore[roomId] || typeof profilesStore[roomId] !== "object") {
       profilesStore[roomId] = { updatedAt: Date.now(), profiles: {} };
@@ -334,7 +417,7 @@ const server = http.createServer(async (request, response) => {
           nickname: String(payload.nickname || "小鹿").trim().slice(0, 40) || "小鹿",
           signature: String(payload.signature || "").trim().slice(0, 120),
           avatarIndex: Number.isFinite(Number(payload.avatarIndex)) ? Number(payload.avatarIndex) : 0,
-          avatarData: String(payload.avatarData || "").trim(),
+          avatarData: normalizeAvatarData(payload.avatarData),
           updatedAt: Date.now()
         };
         roomProfiles.updatedAt = Date.now();
@@ -357,7 +440,12 @@ const server = http.createServer(async (request, response) => {
     }
     const callStore = getCallSignalsStore();
     if (!Array.isArray(callStore[roomId])) callStore[roomId] = [];
-    const signals = callStore[roomId];
+    const originalSignals = callStore[roomId];
+    const signals = cleanCallSignals(originalSignals);
+    if (signals.length !== originalSignals.length) {
+      callStore[roomId] = signals;
+      await saveStore();
+    }
     if (method === "GET") {
       const after = Math.max(0, Number(url.searchParams.get("after") || 0));
       sendJson(response, 200, { signals: signals.filter((item) => Number(item.id || 0) > after) });
@@ -380,7 +468,7 @@ const server = http.createServer(async (request, response) => {
           createdAt: Date.now()
         };
         signals.push(signal);
-        if (signals.length > 300) signals.splice(0, signals.length - 300);
+        callStore[roomId] = cleanCallSignals(signals);
         await saveStore();
         sendJson(response, 200, { ok: true, signal });
       } catch (error) {
