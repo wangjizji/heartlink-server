@@ -301,13 +301,38 @@ const server = http.createServer(async (request, response) => {
       const mimeType = decodeURIComponent(fileName.split("__")[1] || "application/octet-stream");
       try {
         const stat = await fs.promises.stat(filePath);
-        response.writeHead(200, {
+        const rangeHeader = String(request.headers.range || "").trim();
+        const commonHeaders = {
           "Content-Type": mimeType,
-          "Content-Length": stat.size,
           "Access-Control-Allow-Origin": "*",
-          "Cache-Control": "public, max-age=86400"
+          "Cache-Control": "public, max-age=86400",
+          "Accept-Ranges": "bytes"
+        };
+        if (!rangeHeader) {
+          response.writeHead(200, { ...commonHeaders, "Content-Length": stat.size });
+          fs.createReadStream(filePath).pipe(response);
+          return;
+        }
+        const match = rangeHeader.match(/^bytes=(\d*)-(\d*)$/i);
+        if (!match || (!match[1] && !match[2])) {
+          response.writeHead(416, { ...commonHeaders, "Content-Range": `bytes */${stat.size}` });
+          response.end();
+          return;
+        }
+        let start = match[1] ? Number(match[1]) : Math.max(0, stat.size - Number(match[2]));
+        let end = match[2] ? Number(match[2]) : stat.size - 1;
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || start >= stat.size || start > end) {
+          response.writeHead(416, { ...commonHeaders, "Content-Range": `bytes */${stat.size}` });
+          response.end();
+          return;
+        }
+        end = Math.min(end, stat.size - 1);
+        response.writeHead(206, {
+          ...commonHeaders,
+          "Content-Length": end - start + 1,
+          "Content-Range": `bytes ${start}-${end}/${stat.size}`
         });
-        fs.createReadStream(filePath).pipe(response);
+        fs.createReadStream(filePath, { start, end }).pipe(response);
       } catch {
         sendJson(response, 404, { error: "文件不存在" });
       }
