@@ -806,9 +806,11 @@ const server = http.createServer(async (request, response) => {
     }
     if (statusChanged) {
       room.updatedAt = Date.now();
-      await saveStore();
     }
     sendJson(response, 200, { roomId, messages: room.messages, updatedAt: room.updatedAt });
+    if (statusChanged) {
+      void saveStore().catch((error) => console.error("保存消息送达状态失败：", error.message));
+    }
     return;
   }
   if (method === "POST" && messageId) {
