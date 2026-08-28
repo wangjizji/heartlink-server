@@ -258,6 +258,9 @@ const normalizeMessage = (payload, roomId) => {
   const text = String(payload && (payload.text || payload.content) || "").trim();
   const type = String(payload && payload.type || "text");
   const audioDataUrl = String(payload && payload.audioDataUrl || "").trim();
+  if (audioDataUrl.startsWith("data:") && audioDataUrl.length > 200000) {
+    throw new Error("语音必须先上传为文件，不能直接写入消息");
+  }
   const encryptedText = type === "text"
     && payload && payload.encryption
     && String(payload.encryption.ciphertext || "").trim()
