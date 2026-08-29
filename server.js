@@ -429,7 +429,10 @@ const server = http.createServer(async (request, response) => {
     }
     const roomProfiles = profilesStore[roomId];
     if (method === "GET") {
-      sendJson(response, 200, { profiles: Object.values(roomProfiles.profiles || {}) });
+      sendJson(response, 200, {
+        profiles: Object.values(roomProfiles.profiles || {}),
+        relationshipNickname: String(roomProfiles.relationshipNickname || "")
+      });
       return;
     }
     if (method === "POST") {
@@ -448,6 +451,9 @@ const server = http.createServer(async (request, response) => {
           avatarData: normalizeAvatarData(payload.avatarData),
           updatedAt: Date.now()
         };
+        if (Object.prototype.hasOwnProperty.call(payload, "relationshipNickname")) {
+          roomProfiles.relationshipNickname = String(payload.relationshipNickname || "").trim().slice(0, 40);
+        }
         roomProfiles.updatedAt = Date.now();
         await saveStore();
         sendJson(response, 200, { ok: true, profile: roomProfiles.profiles[id] });
